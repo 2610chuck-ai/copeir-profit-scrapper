@@ -2,10 +2,9 @@
   "name": "copy-profit-scraper",
   "private": true,
   "type": "module",
- "scripts": {
-  "start": "node server.js",
-  "postinstall": "npx playwright install --with-deps"
-}
+  "scripts": {
+    "start": "node server.js",
+    "postinstall": "npx playwright install --with-deps"
   },
   "dependencies": {
     "express": "^4.19.2",
