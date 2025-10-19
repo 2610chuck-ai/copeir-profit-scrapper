@@ -1,97 +1,153 @@
+// --- robust server.js für Render ---
+// Falls Playwright zur Laufzeit doch noch den globalen Pfad nutzt:
+process.env.PLAYWRIGHT_BROWSERS_PATH = "0";
+
 import express from "express";
 import { chromium } from "playwright";
 
 const app = express();
 
-// --- CORS ---
+// ---------- CORS ----------
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   next();
 });
 
-// --- globaler Browser (Singleton) ---
+// ---------- Browser-Management (Singleton + Auto-Heal) ----------
 let browserPromise = null;
-async function getBrowser() {
-  if (!browserPromise) {
-    browserPromise = chromium.launch({
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--single-process",
-        "--no-zygote",
-      ],
-      headless: true,
-    });
-  }
-  return browserPromise;
+
+async function createBrowser() {
+  // Minimal-Flags, die auf Render stabil sind
+  return chromium.launch({
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      // die beiden sind fehleranfällig, daher NICHT nutzen:
+      // "--single-process",
+      // "--no-zygote",
+    ],
+  });
 }
 
-// --- Healthcheck & einfache Ping-Route ---
-app.get("/", (req, res) => res.type("text").send("OK"));
-app.get("/api/ping", (req, res) => res.json({ ok: true, t: Date.now() }));
+async function getBrowser() {
+  // Falls nie erzeugt, erstellen
+  if (!browserPromise) browserPromise = createBrowser();
+  let browser;
+  try {
+    browser = await browserPromise;
+    // wenn Render den Prozess gekillt hat:
+    if (!browser || !browser.isConnected()) throw new Error("browser not connected");
+    return browser;
+  } catch (_) {
+    // Neu starten (Auto-Heal)
+    try {
+      if (browser && browser.isConnected()) await browser.close().catch(() => {});
+    } catch {}
+    browserPromise = createBrowser();
+    return browserPromise;
+  }
+}
 
-// --- Haupt-Route ---
+async function resetBrowser() {
+  try {
+    const b = browserPromise ? await browserPromise : null;
+    if (b && b.isConnected()) await b.close().catch(() => {});
+  } catch {}
+  browserPromise = null;
+  return getBrowser();
+}
+
+// ---------- Health ----------
+app.get("/", (_req, res) => res.type("text").send("OK"));
+app.get("/healthz", (_req, res) => res.json({ ok: true, t: Date.now() }));
+app.get("/api/ping", (_req, res) => res.json({ ok: true, t: Date.now() }));
+
+// ---------- Haupt-Route ----------
 app.get("/api/scrape-profit", async (req, res) => {
   const url = req.query.url;
-  const sel = req.query.sel;   // optional: CSS-Selector
-  const txt = req.query.text;  // optional: Textsuche
+  const sel = req.query.sel;   // CSS-Selector (optional)
+  const txt = req.query.text;  // Textsuche (optional)
+
   if (!url || (!sel && !txt)) {
     return res.status(400).json({ error: "Need url and sel OR text" });
   }
 
-  let context, page;
-  try {
-    const browser = await getBrowser();
-    context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-    });
-    page = await context.newPage();
+  // Retry-Logik, falls Render im Free-Plan den Browser „abschießt“
+  const attempt = async () => {
+    let context, page;
+    try {
+      const browser = await getBrowser();
+      context = await browser.newContext({
+        userAgent:
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+      });
+      page = await context.newPage();
 
-    await page.goto(String(url), { waitUntil: "networkidle", timeout: 60000 });
-    // kleiner Puffer, weil viele Seiten noch nachladen
-    await page.waitForTimeout(1200);
+      await page.goto(String(url), { waitUntil: "networkidle", timeout: 60000 });
+      // kleine Extra-Wartezeit für dynamische Seiten
+      await page.waitForTimeout(1200);
 
-    let raw;
-    if (sel) {
-      await page.waitForSelector(String(sel), { timeout: 30000 });
-      raw = await page.$eval(String(sel), (el) => el.innerText.trim());
-    } else {
-      raw = await page.evaluate((needle) => {
-        function vis(el) {
-          const s = getComputedStyle(el);
-          return s && s.visibility !== "hidden" && s.display !== "none";
-        }
-        const all = Array.from(document.querySelectorAll("body *"));
-        const el = all.find((e) => vis(e) && e.innerText && e.innerText.includes(needle));
-        return el ? el.innerText.trim() : null;
-      }, String(txt));
-      if (!raw) throw new Error("Text not found");
+      let raw;
+      if (sel) {
+        await page.waitForSelector(String(sel), { timeout: 30000 });
+        raw = await page.$eval(String(sel), (el) => el.innerText.trim());
+      } else {
+        // einfache Textsuche (erstes sichtbares Element mit diesem Teilstring)
+        raw = await page.evaluate((needle) => {
+          function vis(el) {
+            const s = getComputedStyle(el);
+            return s && s.visibility !== "hidden" && s.display !== "none";
+          }
+          const all = Array.from(document.querySelectorAll("body *"));
+          const el = all.find((e) => vis(e) && e.innerText && e.innerText.includes(needle));
+          return el ? el.innerText.trim() : null;
+        }, String(txt));
+        if (!raw) throw new Error("Text not found");
+      }
+
+      // Zahl robust parsen (de/en)
+      const normalized = raw.replace(/[^0-9,.\-]/g, "");
+      const lc = normalized.lastIndexOf(",");
+      const ld = normalized.lastIndexOf(".");
+      const ls = Math.max(lc, ld);
+      let num = normalized;
+      if (lc !== -1 && ld !== -1) {
+        num = normalized.replace(/[,\.]/g, (m, i) => (i === ls ? "." : ""));
+      } else if (lc !== -1) {
+        num = normalized.replace(/\./g, "").replace(",", ".");
+      } else {
+        num = normalized.replace(/,/g, "");
+      }
+      const profit = parseFloat(num);
+
+      return { profit: Number.isFinite(profit) ? profit : null, raw };
+    } finally {
+      // immer sauber schließen (nicht den globalen Browser!)
+      try { if (page) await page.close(); } catch {}
+      try { if (context) await context.close(); } catch {}
     }
+  };
 
-    // Zahl robust parsen (de/en)
-    const normalized = raw.replace(/[^0-9,.\-]/g, "");
-    const lc = normalized.lastIndexOf(","),
-      ld = normalized.lastIndexOf(".");
-    const ls = Math.max(lc, ld);
-    let num = normalized;
-    if (lc !== -1 && ld !== -1) num = normalized.replace(/[,\.]/g, (m, i) => (i === ls ? "." : ""));
-    else if (lc !== -1) num = normalized.replace(/\./g, "").replace(",", ".");
-    else num = normalized.replace(/,/g, "");
-    const profit = parseFloat(num);
-
-    res.json({ profit: Number.isFinite(profit) ? profit : null, raw });
+  try {
+    // 1. Versuch
+    try {
+      const out = await attempt();
+      return res.json(out);
+    } catch (e1) {
+      // Wenn der Browser zwischendurch gekillt wurde: Browser neu starten, 2. Versuch
+      await resetBrowser();
+      const out2 = await attempt();
+      return res.json(out2);
+    }
   } catch (e) {
-    res.status(500).json({ error: String(e) });
-  } finally {
-    if (page) await page.close().catch(() => {});
-    if (context) await context.close().catch(() => {});
+    return res.status(500).json({ error: String(e) });
   }
 });
 
-// --- Warmup beim Start: Browser vorbereiten ---
+// ---------- Warmup beim Start ----------
 (async () => {
   try {
     const browser = await getBrowser();
@@ -106,7 +162,7 @@ app.get("/api/scrape-profit", async (req, res) => {
   }
 })();
 
-// --- Graceful shutdown (Render Stop/Restart) ---
+// ---------- Graceful shutdown ----------
 process.on("SIGTERM", async () => {
   try {
     if (browserPromise) (await browserPromise).close();
