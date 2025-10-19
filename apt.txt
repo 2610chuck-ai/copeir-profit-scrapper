@@ -1,0 +1,23 @@
+# System packages needed for Playwright Chromium on Debian/Ubuntu (Render)
+libnss3
+libatk1.0-0
+libatk-bridge2.0-0
+libxcomposite1
+libxdamage1
+libxfixes3
+libxrandr2
+libgbm1
+libgtk-3-0
+libpango-1.0-0
+libasound2
+libxshmfence1
+libx11-xcb1
+libdrm2
+libxext6
+libxcursor1
+libxi6
+libxrender1
+libxss1
+ca-certificates
+fonts-liberation
+fonts-noto-color-emoji
