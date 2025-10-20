@@ -1,174 +1,128 @@
-// --- robust server.js für Render ---
-// Falls Playwright zur Laufzeit doch noch den globalen Pfad nutzt:
-process.env.PLAYWRIGHT_BROWSERS_PATH = "0";
-
 import express from "express";
 import { chromium } from "playwright";
 
 const app = express();
 
-// ---------- CORS ----------
+// CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   next();
 });
 
-// ---------- Browser-Management (Singleton + Auto-Heal) ----------
 let browserPromise = null;
-
-async function createBrowser() {
-  // Minimal-Flags, die auf Render stabil sind
-  return chromium.launch({
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      // die beiden sind fehleranfällig, daher NICHT nutzen:
-      // "--single-process",
-      // "--no-zygote",
-    ],
-  });
-}
-
 async function getBrowser() {
-  // Falls nie erzeugt, erstellen
-  if (!browserPromise) browserPromise = createBrowser();
-  let browser;
-  try {
-    browser = await browserPromise;
-    // wenn Render den Prozess gekillt hat:
-    if (!browser || !browser.isConnected()) throw new Error("browser not connected");
-    return browser;
-  } catch (_) {
-    // Neu starten (Auto-Heal)
-    try {
-      if (browser && browser.isConnected()) await browser.close().catch(() => {});
-    } catch {}
-    browserPromise = createBrowser();
-    return browserPromise;
+  if (!browserPromise) {
+    browserPromise = chromium.launch({
+      headless: true,
+      args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-gpu"]
+    });
   }
+  return browserPromise;
 }
 
-async function resetBrowser() {
-  try {
-    const b = browserPromise ? await browserPromise : null;
-    if (b && b.isConnected()) await b.close().catch(() => {});
-  } catch {}
-  browserPromise = null;
-  return getBrowser();
-}
-
-// ---------- Health ----------
 app.get("/", (_req, res) => res.type("text").send("OK"));
-app.get("/healthz", (_req, res) => res.json({ ok: true, t: Date.now() }));
-app.get("/api/ping", (_req, res) => res.json({ ok: true, t: Date.now() }));
 
-// ---------- Haupt-Route ----------
+// GET /api/scrape-profit?url=...&sel=... | &text=... | &nth=3 | &all=1
 app.get("/api/scrape-profit", async (req, res) => {
   const url = req.query.url;
-  const sel = req.query.sel;   // CSS-Selector (optional)
-  const txt = req.query.text;  // Textsuche (optional)
+  const sel = req.query.sel && String(req.query.sel).trim();
+  const txt = req.query.text && String(req.query.text).trim();
+  const nth = req.query.nth ? Math.max(1, parseInt(String(req.query.nth), 10)) : null; // 1-based
+  const wantAll = String(req.query.all || '').toLowerCase() === '1';
 
-  if (!url || (!sel && !txt)) {
-    return res.status(400).json({ error: "Need url and sel OR text" });
+  if (!url || (!sel && !txt && !wantAll)) {
+    return res.status(400).json({ error: "Need url and (sel OR text) or set all=1" });
   }
 
-  // Retry-Logik, falls Render im Free-Plan den Browser „abschießt“
-  const attempt = async () => {
-    let context, page;
-    try {
-      const browser = await getBrowser();
-      context = await browser.newContext({
-        userAgent:
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-      });
-      page = await context.newPage();
-
-      await page.goto(String(url), { waitUntil: "networkidle", timeout: 60000 });
-      // kleine Extra-Wartezeit für dynamische Seiten
-      await page.waitForTimeout(1200);
-
-      let raw;
-      if (sel) {
-        await page.waitForSelector(String(sel), { timeout: 30000 });
-        raw = await page.$eval(String(sel), (el) => el.innerText.trim());
-      } else {
-        // einfache Textsuche (erstes sichtbares Element mit diesem Teilstring)
-        raw = await page.evaluate((needle) => {
-          function vis(el) {
-            const s = getComputedStyle(el);
-            return s && s.visibility !== "hidden" && s.display !== "none";
-          }
-          const all = Array.from(document.querySelectorAll("body *"));
-          const el = all.find((e) => vis(e) && e.innerText && e.innerText.includes(needle));
-          return el ? el.innerText.trim() : null;
-        }, String(txt));
-        if (!raw) throw new Error("Text not found");
-      }
-
-      // Zahl robust parsen (de/en)
-      const normalized = raw.replace(/[^0-9,.\-]/g, "");
-      const lc = normalized.lastIndexOf(",");
-      const ld = normalized.lastIndexOf(".");
-      const ls = Math.max(lc, ld);
-      let num = normalized;
-      if (lc !== -1 && ld !== -1) {
-        num = normalized.replace(/[,\.]/g, (m, i) => (i === ls ? "." : ""));
-      } else if (lc !== -1) {
-        num = normalized.replace(/\./g, "").replace(",", ".");
-      } else {
-        num = normalized.replace(/,/g, "");
-      }
-      const profit = parseFloat(num);
-
-      return { profit: Number.isFinite(profit) ? profit : null, raw };
-    } finally {
-      // immer sauber schließen (nicht den globalen Browser!)
-      try { if (page) await page.close(); } catch {}
-      try { if (context) await context.close(); } catch {}
-    }
-  };
-
+  let ctx, page;
   try {
-    // 1. Versuch
-    try {
-      const out = await attempt();
-      return res.json(out);
-    } catch (e1) {
-      // Wenn der Browser zwischendurch gekillt wurde: Browser neu starten, 2. Versuch
-      await resetBrowser();
-      const out2 = await attempt();
-      return res.json(out2);
+    const browser = await getBrowser();
+    ctx = await browser.newContext({
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+      locale: "de-DE",
+      timezoneId: "Europe/Berlin",
+      extraHTTPHeaders: { "Accept-Language": "de-DE,de;q=0.9,en;q=0.8" },
+      viewport: { width: 1366, height: 900 }
+    });
+    page = await ctx.newPage();
+
+    await page.goto(String(url), { waitUntil: "networkidle", timeout: 90000 });
+    await page.waitForTimeout(1500);
+
+    const parseNum = (raw) => {
+      if (!raw) return null;
+      const norm = String(raw).replace(/[^0-9,.\-+]/g, "");
+      const lc = norm.lastIndexOf(","), ld = norm.lastIndexOf(".");
+      const ls = Math.max(lc, ld);
+      let s = norm;
+      if (lc !== -1 && ld !== -1) s = norm.replace(/[,\.]/g, (m,i)=> (i===ls? ".": ""));
+      else if (lc !== -1) s = norm.replace(/\./g,"").replace(",","."); // de
+      else s = norm.replace(/,/g,""); // en
+      const v = parseFloat(s);
+      return Number.isFinite(v) ? v : null;
+    };
+
+    let texts = [];
+    if (sel) {
+      try {
+        await page.waitForSelector(sel, { timeout: 15000 });
+        texts = await page.$$eval(sel, els => els.map(e => e.innerText?.trim() || "").filter(Boolean));
+      } catch {}
     }
+    if (texts.length === 0) {
+      texts = await page.evaluate((needle) => {
+        function vis(el){ const s=getComputedStyle(el); return s && s.visibility!=="hidden" && s.display!=="none";}
+        const arr = [];
+        for (const el of Array.from(document.querySelectorAll("body *"))) {
+          if (!vis(el)) continue;
+          const t = el.innerText?.trim();
+          if (!t) continue;
+          if (!needle || t.includes(needle)) arr.push(t);
+        }
+        return arr;
+      }, txt || null);
+    }
+
+    const numRe = /[-+]?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?/g;
+    const matches = [];
+    for (const t of texts) {
+      const parts = t.match(numRe);
+      if (parts) for (const p of parts) matches.push({ raw: p, profit: parseNum(p) });
+    }
+    const nums = matches.filter(m => m.profit !== null);
+
+    if (wantAll) {
+      return res.json({ count: nums.length, items: nums });
+    }
+
+    const pick = (nth && nums[nth-1]) || nums[0];
+    if (!pick) throw new Error("No number found");
+    return res.json({ ...pick, index: nth || 1, total: nums.length });
   } catch (e) {
     return res.status(500).json({ error: String(e) });
+  } finally {
+    try { if (page) await page.close(); } catch {}
+    try { if (ctx) await ctx.close(); } catch {}
   }
 });
 
-// ---------- Warmup beim Start ----------
+// Warmup
 (async () => {
   try {
-    const browser = await getBrowser();
-    const ctx = await browser.newContext();
-    const p = await ctx.newPage();
+    const b = await getBrowser();
+    const c = await b.newContext();
+    const p = await c.newPage();
     await p.goto("https://example.com", { waitUntil: "domcontentloaded", timeout: 15000 });
-    await p.close();
-    await ctx.close();
+    await p.close(); await c.close();
     console.log("Warmup done");
   } catch (e) {
     console.log("Warmup skipped:", String(e));
   }
 })();
 
-// ---------- Graceful shutdown ----------
 process.on("SIGTERM", async () => {
-  try {
-    if (browserPromise) (await browserPromise).close();
-  } finally {
-    process.exit(0);
-  }
+  try { if (browserPromise) (await browserPromise).close(); }
+  finally { process.exit(0); }
 });
 
 app.listen(process.env.PORT || 3000, () => console.log("Scraper API ready"));
