@@ -1,12 +1,17 @@
 {
-  "name": "copy-profit-scraper",
-  "private": true,
+  "name": "copeir-profit-scrapper",
+  "version": "1.0.0",
+  "description": "Bitget profit scraper API (Playwright)",
   "type": "module",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
+    "cors": "^2.8.5",
     "express": "^4.19.2",
-    "playwright": "^1.48.0"
+    "playwright-core": "^1.48.2"
   }
 }
