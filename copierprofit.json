@@ -1,0 +1,54 @@
+{
+  "currency": "USDT",
+  "copiers": [
+    {
+      "name": "chuck_2610",
+      "start": "2025-10-02",
+      "capital": 21496.53,
+      "sourceUrl": "https://www.bitget.com/de/copy-trading/trader/bfbc477e88b23d51a792/futures-followers",
+      "who": "Chuck_2610"
+    },
+    {
+      "name": "chucksmum_0103",
+      "start": "2025-09-23",
+      "capital": 5750,
+      "sourceUrl": "https://www.bitget.com/de/copy-trading/trader/bfbc477e88b23d51a792/futures-followers",
+      "who": "chucksmum_0103"
+    },
+    {
+      "name": "BGUSER-62WNLU03",
+      "start": "2025-09-23",
+      "capital": 4991,
+      "sourceUrl": "https://www.bitget.com/de/copy-trading/trader/bfbc477e88b23d51a792/futures-followers",
+      "who": "BGUSER-62WNLU03"
+    },
+    {
+      "name": "King_Wilhelm",
+      "start": "2025-09-23",
+      "capital": 3267,
+      "sourceUrl": "https://www.bitget.com/de/copy-trading/trader/bfbc477e88b23d51a792/futures-followers",
+      "who": "King_Wilhelm"
+    },
+    {
+      "name": "Dule_84",
+      "start": "2025-09-23",
+      "capital": 1201.6,
+      "sourceUrl": "https://www.bitget.com/de/copy-trading/trader/bfbc477e88b23d51a792/futures-followers",
+      "who": "Dule84"
+    },
+    {
+      "name": "BGUSER-K9N4G5MR",
+      "start": "2025-10-14",
+      "capital": 1188,
+      "sourceUrl": "https://www.bitget.com/de/copy-trading/trader/bfbc477e88b23d51a792/futures-followers",
+      "who": "BGUSER-K9N4G5MR"
+    },
+    {
+      "name": "chuckles_1602",
+      "start": "2025-10-14",
+      "capital": 15000,
+      "sourceUrl": "https://www.bitget.com/de/copy-trading/trader/bfbc477e88b23d51a792/futures-followers",
+      "who": "chuckles_1602"
+    }
+  ]
+}
