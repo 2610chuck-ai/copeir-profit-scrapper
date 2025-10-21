@@ -1,244 +1,312 @@
-// server.js – angepasst auf copierprofit.json { currency, copiers: [...] }
-
+// server.js
+// Node 22, ESM. Braucht: "type": "module" in package.json
 import express from "express";
-import cors from "cors";
-import { chromium } from "playwright";
 import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
+import { chromium } from "playwright";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.use(cors());
 app.use(express.json());
 
-// ----------------------- Cache -----------------------
-let LAST_RESULTS = { updatedAt: null, currency: "USDT", items: [] };
+// CORS offen für dein Frontend
+app.use((_, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  next();
+});
 
-// ------------------ Browser-Singleton ----------------
-let browserPromise = null;
+const CONFIG_PATH = path.join(__dirname, "copierprofit.json");
 
-async function launchBrowser() {
-  return chromium.launch({
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--single-process",
-      "--no-zygote",
-      "--disable-background-networking",
-      "--disable-background-timer-throttling",
-      "--disable-breakpad",
-      "--disable-default-apps",
-      "--no-first-run",
-      "--no-default-browser-check",
-    ],
-  });
-}
-
-async function getBrowser() {
-  try {
-    if (!browserPromise) browserPromise = launchBrowser();
-    const b = await browserPromise;
-    if (!b || b.isConnected?.() === false) {
-      try { await b?.close(); } catch {}
-      browserPromise = launchBrowser();
-      return await browserPromise;
-    }
-    return b;
-  } catch {
-    try { (await browserPromise)?.close(); } catch {}
-    browserPromise = launchBrowser();
-    return await browserPromise;
-  }
-}
-
-async function withRetry(fn) {
-  try {
-    return await fn();
-  } catch (e) {
-    const msg = String(e || "");
-    const shouldRetry =
-      /Target page|context|browser has been closed|Browser has been closed|browserType\.launch|Executable doesn't exist/.test(
-        msg
-      );
-    if (!shouldRetry) throw e;
-    try { (await browserPromise)?.close(); } catch {}
-    browserPromise = launchBrowser();
-    return await fn();
-  }
-}
-
-// ----------------- Utilities -----------------
-function parseAnyNumber(raw) {
+// ---------- Helpers ----------
+/** robustes Zahl-Parsing (unterstützt 1.234,56 und 1,234.56) */
+function parseNumberFlexible(raw) {
   if (!raw) return null;
-  const cleaned = String(raw).replace(/[^\d,.\-+]/g, "");
-  const lc = cleaned.lastIndexOf(",");
-  const ld = cleaned.lastIndexOf(".");
+  const norm = String(raw).replace(/[^0-9,.\-+]/g, "");
+  const lc = norm.lastIndexOf(","), ld = norm.lastIndexOf(".");
   const ls = Math.max(lc, ld);
-  let normalized = cleaned;
+  let s = norm;
   if (lc !== -1 && ld !== -1) {
-    normalized = cleaned.replace(/[,\.]/g, (m, i) => (i === ls ? "." : ""));
+    // beide vorhanden -> letzter ist Dezimaltrenner
+    s = norm.replace(/[,\.]/g, (m, i) => (i === ls ? "." : ""));
   } else if (lc !== -1) {
-    normalized = cleaned.replace(/\./g, "").replace(",", ".");
+    // nur Komma -> Komma ist Dezimaltrenner
+    s = norm.replace(/\./g, "").replace(",", ".");
   } else {
-    normalized = cleaned.replace(/,/g, "");
+    // nur Punkt oder nichts
+    s = norm.replace(/,/g, "");
   }
-  const num = parseFloat(normalized);
-  return Number.isFinite(num) ? num : null;
+  const v = parseFloat(s);
+  return Number.isFinite(v) ? v : null;
 }
 
-// ----------------- Core scrape -----------------
-// Holt Gewinn für EINEN Follower anhand von `who` auf `sourceUrl`.
-async function fetchProfitForCopier(page, { sourceUrl, who }) {
-  await page.goto(String(sourceUrl), { waitUntil: "domcontentloaded", timeout: 45000 });
-  await page.waitForTimeout(800);
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  // Im DOM: Block für die Person finden (who-Text) und darin die erste Zahl mit +/- abgreifen.
-  const found = await page.evaluate((needle) => {
-    function visible(el) {
-      const s = getComputedStyle(el);
-      return s && s.visibility !== "hidden" && s.display !== "none";
-    }
-    // Alle sichtbaren Elemente, die den Namen enthalten
-    const matches = Array.from(document.querySelectorAll("body *"))
-      .filter((e) => visible(e) && e.innerText && e.innerText.includes(needle));
-
-    if (!matches.length) return { raw: null, blockText: null };
-
-    // Nimm einen sinnvollen Container (li/section/article/div), sonst das Element selbst
-    const container =
-      matches
-        .map((e) => e.closest("li,article,section,div"))
-        .find(Boolean) || matches[0];
-
-    const text = container?.innerText || matches[0].innerText || "";
-
-    // Suche nach Zahl mit Vorzeichen (grüne Gewinne sind meist mit "+")
-    const numbers = text.match(/[+\-]?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?/g);
-    let pick = null;
-    if (numbers && numbers.length) {
-      // bevorzugt Werte mit Vorzeichen
-      pick = numbers.find((s) => /^[+\-]/.test(s)) || numbers[0];
-    }
-    return { raw: pick, blockText: text };
-  }, String(who));
-
-  const raw = found?.raw || null;
-  const profit = parseAnyNumber(raw);
-  return { raw, profit, debug: found?.blockText || null };
+// ---------- Browser-Singleton + Mutex ----------
+let browserPromise = null;
+async function getBrowser() {
+  if (!browserPromise) {
+    browserPromise = chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-zygote",
+        "--single-process",
+      ],
+    });
+  }
+  return browserPromise;
 }
+let running = false; // einfacher Mutex, 1 Task zur Zeit
 
-// Liest dein copierprofit.json (Objekt mit currency + copiers[]) und scrapt alle
-async function scrapeAllFollowers() {
-  const cfgPath = path.join(__dirname, "copierprofit.json");
-  let cfg;
-  try {
-    const raw = await fs.readFile(cfgPath, "utf8");
-    cfg = JSON.parse(raw);
-  } catch (e) {
-    throw new Error("copierprofit.json konnte nicht gelesen werden: " + String(e));
+// ---------- Cache im Speicher ----------
+let LAST = { updatedAt: null, currency: "USDT", items: [] };
+
+// ---------- Routen ----------
+app.get("/", (_req, res) => res.type("text").send("OK"));
+app.get("/api/ping", (_req, res) => res.json({ ok: true, t: Date.now() }));
+
+// direkter Einzelscrape bleibt optional verfügbar (dein altes Endpoint)
+// GET /api/scrape-profit?url=...&all=1 oder &sel=.../&text=...
+app.get("/api/scrape-profit", async (req, res) => {
+  const url = req.query.url;
+  const sel = req.query.sel && String(req.query.sel).trim();
+  const txt = req.query.text && String(req.query.text).trim();
+  const nth = req.query.nth ? Math.max(1, parseInt(String(req.query.nth), 10)) : null;
+  const wantAll = String(req.query.all || "").toLowerCase() === "1";
+  if (!url || (!sel && !txt && !wantAll)) {
+    return res.status(400).json({ error: "Need url and (sel OR text) or set all=1" });
   }
 
-  if (!cfg || !Array.isArray(cfg.copiers)) {
-    throw new Error("copierprofit.json muss { currency, copiers:[...] } enthalten.");
-  }
-
-  const currency = cfg.currency || "USDT";
-  const copiers = cfg.copiers;
-
-  const browser = await getBrowser();
-  const context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-  });
-  const page = await context.newPage();
-
-  const items = [];
-  try {
-    // SERIELL abarbeiten (stabiler im Free-Plan)
-    for (const c of copiers) {
-      const { name, start, capital, sourceUrl, who } = c;
-      let ok = true, error = null, raw = null, profit = null;
-
-      if (sourceUrl && who) {
-        try {
-          const r = await fetchProfitForCopier(page, { sourceUrl, who });
-          raw = r.raw;
-          profit = r.profit;
-          // Du kannst r.debug in Logs schreiben, wenn du willst:
-          // console.log("DEBUG TEXT for", who, r.debug?.slice(0,200));
-        } catch (e) {
-          ok = false;
-          error = String(e);
-        }
-      } else {
-        ok = false;
-        error = "sourceUrl und who sind Pflicht";
-      }
-
-      items.push({
-        name: name ?? "",
-        start: start ?? null,
-        capital: Number(capital ?? 0),
-        ok,
-        error,
-        live: { raw, profit },
-      });
-    }
-  } finally {
-    try { await page.close(); } catch {}
-    try { await context.close(); } catch {}
-  }
-
-  LAST_RESULTS = {
-    updatedAt: new Date().toISOString(),
-    currency,
-    items,
-  };
-  return LAST_RESULTS;
-}
-
-// ----------------- Routes -----------------
-app.get("/", (req, res) => res.type("text").send("OK"));
-
-app.get("/api/last-results", (req, res) => {
-  res.json(LAST_RESULTS);
-});
-
-// WICHTIG: POST verwenden!
-app.post("/api/refresh-now", async (req, res) => {
-  try {
-    const payload = await withRetry(() => scrapeAllFollowers());
-    res.json({ ok: true, ...payload });
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
-
-// ----------------- Warmup -----------------
-(async () => {
+  let ctx, page;
   try {
     const browser = await getBrowser();
-    const ctx = await browser.newContext();
-    const p = await ctx.newPage();
+    ctx = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+      locale: "de-DE",
+      timezoneId: "Europe/Berlin",
+      viewport: { width: 1366, height: 900 },
+      extraHTTPHeaders: { "Accept-Language": "de-DE,de;q=0.9,en;q=0.8" },
+    });
+    page = await ctx.newPage();
+    await page.goto(String(url), { waitUntil: "networkidle", timeout: 90000 });
+    await page.waitForTimeout(1500);
+
+    // sichtbare Texte einsammeln
+    let texts = [];
+    if (sel) {
+      try {
+        await page.waitForSelector(sel, { timeout: 15000 });
+        texts = await page.$$eval(sel, (els) =>
+          els.map((e) => e.innerText?.trim() || "").filter(Boolean)
+        );
+      } catch {}
+    }
+    if (texts.length === 0) {
+      texts = await page.evaluate((needle) => {
+        function vis(el) {
+          const s = getComputedStyle(el);
+          return s && s.visibility !== "hidden" && s.display !== "none";
+        }
+        const arr = [];
+        for (const el of Array.from(document.querySelectorAll("body *"))) {
+          if (!vis(el)) continue;
+          const t = el.innerText?.trim();
+          if (!t) continue;
+          if (!needle || t.includes(needle)) arr.push(t);
+        }
+        return arr;
+      }, txt || null);
+    }
+
+    const numRe = /[-+]?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?/g;
+    const matches = [];
+    for (const t of texts) {
+      const parts = t.match(numRe);
+      if (parts) for (const p of parts) matches.push({ raw: p, profit: parseNumberFlexible(p) });
+    }
+    const nums = matches.filter((m) => m.profit !== null);
+
+    if (wantAll) return res.json({ count: nums.length, items: nums });
+
+    const pick = (nth && nums[nth - 1]) || nums[0];
+    if (!pick) throw new Error("No number found");
+    return res.json({ ...pick, index: nth || 1, total: nums.length });
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  } finally {
+    try { if (page) await page.close(); } catch {}
+    try { if (ctx) await ctx.close(); } catch {}
+  }
+});
+
+// --------- MANUELLES UPDATE: POST /api/refresh-now ---------
+app.post("/api/refresh-now", async (_req, res) => {
+  if (running) return res.status(429).json({ ok: false, error: "already running" });
+  running = true;
+
+  let ctx, page;
+  try {
+    // Config laden
+    const cfgRaw = await fs.readFile(CONFIG_PATH, "utf-8");
+    const cfg = JSON.parse(cfgRaw);
+    const currency = String(cfg.currency || "USDT");
+    const list = Array.isArray(cfg.copiers) ? cfg.copiers : [];
+    if (!list.length) throw new Error("copier list empty");
+
+    const targetUrl = list[0].sourceUrl; // alle nutzen gleiche URL
+    const browser = await getBrowser();
+    ctx = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+      locale: "de-DE",
+      timezoneId: "Europe/Berlin",
+      viewport: { width: 1366, height: 900 },
+      extraHTTPHeaders: { "Accept-Language": "de-DE,de;q=0.9,en;q=0.8" },
+    });
+    page = await ctx.newPage();
+
+    await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 90000 });
+    await sleep(1500);
+
+    // minimal scrollen, weil Bitget gern lazy-loadet
+    await page.mouse.wheel(0, 400);
+    await sleep(800);
+
+    // pro Follower den Gewinn extrahieren
+    const whoList = list.map((c) => c.who);
+    const found = await page.evaluate((names) => {
+      // In-Page: Suche Element, das den Follower-Namen enthält. Dann im umgebenden Container
+      // die grüne Gewinn-Zahl (mit +/-) finden.
+      function visible(el) {
+        const s = getComputedStyle(el);
+        return s && s.visibility !== "hidden" && s.display !== "none";
+      }
+      function containsText(el, text) {
+        return el && el.innerText && el.innerText.toLowerCase().includes(text.toLowerCase());
+      }
+      function closestContainer(el, depth = 6) {
+        let cur = el;
+        for (let i = 0; i < depth && cur; i++) {
+          // typische Karten/Zeilen
+          if (
+            cur.matches?.("li, div[role='listitem'], .list-item, .card, .row, .cell, .flex, .grid")
+          ) return cur;
+          cur = cur.parentElement;
+        }
+        return el?.parentElement || el;
+      }
+      const out = [];
+      const numRe = /[-+]?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?/g;
+      for (const name of names) {
+        const candidates = Array.from(document.querySelectorAll("body *"))
+          .filter((n) => visible(n) && containsText(n, name));
+        if (!candidates.length) {
+          out.push({ who: name, raw: null, profitText: null, error: "name not found" });
+          continue;
+        }
+        // nimm erstes Match, suche im Container die grüne Zahl
+        const card = closestContainer(candidates[0]);
+        let profitText = null;
+
+        // typische Klassen für die grüne Gewinnzahl (Bitget zeigt sie in grün)
+        const greenCand = card.querySelectorAll
+          ? card.querySelectorAll(
+              ".text-content-trade-buy-text, .profit, .text-success, .green, .up, [style*='color']"
+            )
+          : [];
+        for (const el of greenCand) {
+          const t = el.textContent?.trim();
+          if (!t) continue;
+          // muss +/- enthalten, sonst überspringen
+          if (!/[+-]\s*\d/.test(t)) continue;
+          profitText = t;
+          break;
+        }
+        if (!profitText) {
+          // Fallback: nimm die erste +/- Zahl im gesamten Karten-Text
+          const text = card.innerText || "";
+          const m = text.match(numRe);
+          if (m && m.length) {
+            // versuche Vorzeichen aus dem Umfeld zu lesen
+            const idx = text.indexOf(m[0]);
+            const sign = /-/.test(text.slice(Math.max(0, idx - 3), idx + 1)) ? "-" : "+";
+            profitText = sign + m[0];
+          }
+        }
+        if (!profitText) {
+          out.push({ who: name, raw: null, profitText: null, error: "profit not found" });
+        } else {
+          out.push({ who: name, raw: profitText, profitText });
+        }
+      }
+      return out;
+    }, whoList);
+
+    // normalisieren & mit Stammdaten verheiraten
+    const items = list.map((c) => {
+      const hit = found.find((f) => f.who === c.who);
+      let profit = null, raw = null, error = null;
+      if (hit) {
+        raw = hit.profitText || hit.raw;
+        if (raw) profit = parseNumberFlexible(hit.profitText || hit.raw);
+        if (!raw || profit === null) error = hit.error || "parse error";
+      } else {
+        error = "not scraped";
+      }
+      return {
+        name: c.name,
+        who: c.who,
+        start: c.start,
+        capital: c.capital,
+        live: { profit, raw, error }
+      };
+    });
+
+    LAST = { updatedAt: new Date().toISOString(), currency, items };
+
+    res.json({ ok: true, ...LAST });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e) });
+  } finally {
+    try { if (page) await page.close(); } catch {}
+    try { if (ctx) await ctx.close(); } catch {}
+    running = false;
+  }
+});
+
+// --------- Cache lesen: GET /api/last-results ---------
+app.get("/api/last-results", (_req, res) => {
+  res.json(LAST);
+});
+
+// ---------- Warmup ----------
+(async () => {
+  try {
+    const b = await getBrowser();
+    const c = await b.newContext();
+    const p = await c.newPage();
     await p.goto("https://example.com", { waitUntil: "domcontentloaded", timeout: 15000 });
-    await p.close();
-    await ctx.close();
+    await p.close(); await c.close();
     console.log("Warmup done");
   } catch (e) {
     console.log("Warmup skipped:", String(e));
   }
 })();
 
-// Graceful shutdown
+// ---------- Shutdown ----------
 process.on("SIGTERM", async () => {
-  try { (await browserPromise)?.close(); } finally { process.exit(0); }
+  try { if (browserPromise) (await browserPromise).close(); }
+  finally { process.exit(0); }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Scraper API ready on :" + PORT));
+app.listen(PORT, () => console.log("Scraper API ready on", PORT));
