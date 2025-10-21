@@ -1,0 +1,12 @@
+{
+  "name": "copeir-profit-scrapper",
+  "type": "module",
+  "scripts": {
+    "start": "node server_cors_fixed.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "playwright": "^1.47.2"
+  }
+}
