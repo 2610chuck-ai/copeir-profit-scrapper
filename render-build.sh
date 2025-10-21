@@ -1,16 +1,26 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-echo "==> Installing npm dependencies"
+echo "=== Render build: starting ==="
+echo "Node: $(node -v)"
+echo "NPM:  $(npm -v)"
+echo "PWD:  $(pwd)"
+ls -la || true
+
+# 1) Install server dependencies (prod only)
 if [ -f package-lock.json ]; then
-  npm ci
+  echo "Using npm ci (lockfile found)"
+  npm ci --omit=dev
 else
-  npm install
+  echo "Using npm install (no lockfile)"
+  npm install --omit=dev
 fi
 
-echo "==> Installing Playwright Chromium browser locally (PLAYWRIGHT_BROWSERS_PATH=0)"
-# Browser in node_modules/.cache installieren, damit der Pfad zur Laufzeit sicher gefunden wird
+# 2) Install Playwright Chromium locally (so the binary is in the build layer)
+#    PLAYWRIGHT_BROWSERS_PATH=0 -> install into node_modules/.local-browsers
 export PLAYWRIGHT_BROWSERS_PATH=0
-npx playwright install chromium
+npx --yes playwright --version || true
+echo "Installing Playwright Chromium..."
+npx --yes playwright install chromium
 
-echo "==> Build finished"
+echo "=== Render build: done ==="
