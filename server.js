@@ -1,5 +1,4 @@
-// server.js (ESM)
-// Robust, seriell, mit Browser-Singleton & Retry
+// server.js – angepasst auf copierprofit.json { currency, copiers: [...] }
 
 import express from "express";
 import cors from "cors";
@@ -15,14 +14,10 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ---------------------------------------------
-// In-Memory Cache der letzten Ergebnisse
-// ---------------------------------------------
-let LAST_RESULTS = { updatedAt: null, items: [] };
+// ----------------------- Cache -----------------------
+let LAST_RESULTS = { updatedAt: null, currency: "USDT", items: [] };
 
-// ---------------------------------------------
-// Robustes Browser-Handling (Singleton + Retry)
-// ---------------------------------------------
+// ------------------ Browser-Singleton ----------------
 let browserPromise = null;
 
 async function launchBrowser() {
@@ -55,15 +50,14 @@ async function getBrowser() {
       return await browserPromise;
     }
     return b;
-  } catch (e) {
+  } catch {
     try { (await browserPromise)?.close(); } catch {}
     browserPromise = launchBrowser();
     return await browserPromise;
   }
 }
 
-// Einmaliger Retry bei „Browser/Page/Context closed“ o.ä.
-async function withRetry(fn, label = "task") {
+async function withRetry(fn) {
   try {
     return await fn();
   } catch (e) {
@@ -73,100 +67,89 @@ async function withRetry(fn, label = "task") {
         msg
       );
     if (!shouldRetry) throw e;
-
-    // Browser neu aufsetzen und einmal wiederholen
     try { (await browserPromise)?.close(); } catch {}
     browserPromise = launchBrowser();
     return await fn();
   }
 }
 
-// ---------------------------------------------
-// Hilfen
-// ---------------------------------------------
+// ----------------- Utilities -----------------
 function parseAnyNumber(raw) {
   if (!raw) return null;
-  // Nur Ziffern, . , und -/+ behalten
   const cleaned = String(raw).replace(/[^\d,.\-+]/g, "");
-
-  // Tausender/Dezimal robust:
   const lc = cleaned.lastIndexOf(",");
   const ld = cleaned.lastIndexOf(".");
   const ls = Math.max(lc, ld);
-
   let normalized = cleaned;
   if (lc !== -1 && ld !== -1) {
-    // beide vorhanden → der letzte trennt die Nachkommastellen
     normalized = cleaned.replace(/[,\.]/g, (m, i) => (i === ls ? "." : ""));
   } else if (lc !== -1) {
-    // nur , → Nachkommastellen, . als Tausender entfernen
     normalized = cleaned.replace(/\./g, "").replace(",", ".");
   } else {
-    // nur . → als Dezimalpunkt, , entfernen
     normalized = cleaned.replace(/,/g, "");
   }
-
   const num = parseFloat(normalized);
   return Number.isFinite(num) ? num : null;
 }
 
-// ---------------------------------------------
-// Kern: einen Profit von einer Seite holen
-// - Entweder per CSS-Selector (`sel`) → innerText
-// - Oder per Textsuche (`text`) → erste sichtbare Stelle, die den Text enthält
-// ---------------------------------------------
-async function fetchProfitFromPage(page, { url, sel, text }) {
-  await page.goto(String(url), { waitUntil: "domcontentloaded", timeout: 45000 });
+// ----------------- Core scrape -----------------
+// Holt Gewinn für EINEN Follower anhand von `who` auf `sourceUrl`.
+async function fetchProfitForCopier(page, { sourceUrl, who }) {
+  await page.goto(String(sourceUrl), { waitUntil: "domcontentloaded", timeout: 45000 });
   await page.waitForTimeout(800);
 
-  let raw = null;
+  // Im DOM: Block für die Person finden (who-Text) und darin die erste Zahl mit +/- abgreifen.
+  const found = await page.evaluate((needle) => {
+    function visible(el) {
+      const s = getComputedStyle(el);
+      return s && s.visibility !== "hidden" && s.display !== "none";
+    }
+    // Alle sichtbaren Elemente, die den Namen enthalten
+    const matches = Array.from(document.querySelectorAll("body *"))
+      .filter((e) => visible(e) && e.innerText && e.innerText.includes(needle));
 
-  if (sel) {
-    // CSS-Selector
-    const el = await page.waitForSelector(sel, { timeout: 30000 });
-    raw = await el.evaluate((n) => n.innerText || n.textContent || "");
-  } else if (text) {
-    raw = await page.evaluate((needle) => {
-      const visible = (e) => {
-        const s = getComputedStyle(e);
-        return s && s.visibility !== "hidden" && s.display !== "none";
-      };
-      const all = Array.from(document.querySelectorAll("body *"));
-      const el = all.find((e) => visible(e) && e.innerText && e.innerText.includes(needle));
-      return el ? el.innerText : null;
-    }, String(text));
-    if (!raw) throw new Error("Text not found: " + text);
-  } else {
-    throw new Error("Need either 'sel' or 'text' for scraping.");
-  }
+    if (!matches.length) return { raw: null, blockText: null };
 
-  // Zahl extrahieren (erste Nummer im String)
-  const m = String(raw).match(/[+\-]?\d{1,3}([.,]\d{3})*([.,]\d+)?/);
-  const num = parseAnyNumber(m ? m[0] : raw);
+    // Nimm einen sinnvollen Container (li/section/article/div), sonst das Element selbst
+    const container =
+      matches
+        .map((e) => e.closest("li,article,section,div"))
+        .find(Boolean) || matches[0];
 
-  return { raw, profit: num };
+    const text = container?.innerText || matches[0].innerText || "";
+
+    // Suche nach Zahl mit Vorzeichen (grüne Gewinne sind meist mit "+")
+    const numbers = text.match(/[+\-]?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?/g);
+    let pick = null;
+    if (numbers && numbers.length) {
+      // bevorzugt Werte mit Vorzeichen
+      pick = numbers.find((s) => /^[+\-]/.test(s)) || numbers[0];
+    }
+    return { raw: pick, blockText: text };
+  }, String(who));
+
+  const raw = found?.raw || null;
+  const profit = parseAnyNumber(raw);
+  return { raw, profit, debug: found?.blockText || null };
 }
 
-// ---------------------------------------------
-// Gesamten Satz aus copierprofit.json scrapen
-// copierprofit.json-Format (Minimal):
-// [
-//   { "name": "Follower 1", "start": "2025-10-02", "capital": 21496.53,
-//     "url": "https://.../futures-followers", "sel": "#__layout span.text-content-trade-buy-text" }
-//   // oder statt "sel" -> "text": "Gewinn" (wird auf Seite gesucht)
-// ]
-// ---------------------------------------------
+// Liest dein copierprofit.json (Objekt mit currency + copiers[]) und scrapt alle
 async function scrapeAllFollowers() {
   const cfgPath = path.join(__dirname, "copierprofit.json");
-  let data;
+  let cfg;
   try {
     const raw = await fs.readFile(cfgPath, "utf8");
-    data = JSON.parse(raw);
+    cfg = JSON.parse(raw);
   } catch (e) {
     throw new Error("copierprofit.json konnte nicht gelesen werden: " + String(e));
   }
 
-  if (!Array.isArray(data)) throw new Error("copierprofit.json muss ein Array sein.");
+  if (!cfg || !Array.isArray(cfg.copiers)) {
+    throw new Error("copierprofit.json muss { currency, copiers:[...] } enthalten.");
+  }
+
+  const currency = cfg.currency || "USDT";
+  const copiers = cfg.copiers;
 
   const browser = await getBrowser();
   const context = await browser.newContext({
@@ -175,30 +158,30 @@ async function scrapeAllFollowers() {
   });
   const page = await context.newPage();
 
-  const results = [];
-
+  const items = [];
   try {
-    // SERIELL! Keine parallelen Seiten.
-    for (const item of data) {
-      const { name, start, capital, url, sel, text } = item;
+    // SERIELL abarbeiten (stabiler im Free-Plan)
+    for (const c of copiers) {
+      const { name, start, capital, sourceUrl, who } = c;
+      let ok = true, error = null, raw = null, profit = null;
 
-      let profit = null;
-      let raw = null;
-      let ok = true;
-      let error = null;
-
-      if (url && (sel || text)) {
+      if (sourceUrl && who) {
         try {
-          const r = await fetchProfitFromPage(page, { url, sel, text });
+          const r = await fetchProfitForCopier(page, { sourceUrl, who });
           raw = r.raw;
           profit = r.profit;
+          // Du kannst r.debug in Logs schreiben, wenn du willst:
+          // console.log("DEBUG TEXT for", who, r.debug?.slice(0,200));
         } catch (e) {
           ok = false;
           error = String(e);
         }
+      } else {
+        ok = false;
+        error = "sourceUrl und who sind Pflicht";
       }
 
-      results.push({
+      items.push({
         name: name ?? "",
         start: start ?? null,
         capital: Number(capital ?? 0),
@@ -212,36 +195,32 @@ async function scrapeAllFollowers() {
     try { await context.close(); } catch {}
   }
 
-  LAST_RESULTS = { updatedAt: new Date().toISOString(), items: results };
+  LAST_RESULTS = {
+    updatedAt: new Date().toISOString(),
+    currency,
+    items,
+  };
   return LAST_RESULTS;
 }
 
-// ---------------------------------------------
-// Routen
-// ---------------------------------------------
-
-// Health
+// ----------------- Routes -----------------
 app.get("/", (req, res) => res.type("text").send("OK"));
 
-// Zuletzt gespeicherte Ergebnisse
 app.get("/api/last-results", (req, res) => {
   res.json(LAST_RESULTS);
 });
 
-// Manuelles Refresh (POST!)
+// WICHTIG: POST verwenden!
 app.post("/api/refresh-now", async (req, res) => {
   try {
-    const payload = await withRetry(() => scrapeAllFollowers(), "refresh-all");
+    const payload = await withRetry(() => scrapeAllFollowers());
     res.json({ ok: true, ...payload });
   } catch (e) {
-    // Für Diagnose: Browserlogs zurückgeben
     res.status(500).json({ error: String(e) });
   }
 });
 
-// ---------------------------------------------
-// Warmup (sanft, ohne die echte Liste zu scrapen)
-// ---------------------------------------------
+// ----------------- Warmup -----------------
 (async () => {
   try {
     const browser = await getBrowser();
@@ -256,11 +235,10 @@ app.post("/api/refresh-now", async (req, res) => {
   }
 })();
 
-// Graceful Shutdown
+// Graceful shutdown
 process.on("SIGTERM", async () => {
   try { (await browserPromise)?.close(); } finally { process.exit(0); }
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Scraper API ready on :" + PORT));
-
