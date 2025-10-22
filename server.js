@@ -17,7 +17,6 @@ app.use((_, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (res.req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
 
@@ -45,83 +44,36 @@ function parseNumberFlexible(raw) {
   return Number.isFinite(v) ? v : null;
 }
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ---------- Robuster Browser-Singleton ----------
-let browser = null;
-
-async function launchBrowser() {
-  try { if (browser) await browser.close(); } catch {}
-  browser = await chromium.launch({
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--no-zygote",
-      "--single-process",
-      "--no-first-run",
-      "--no-default-browser-check",
-    ],
-  });
-  return browser;
-}
-
+// ---------- Browser-Singleton + Mutex ----------
+let browserPromise = null;
 async function getBrowser() {
-  // Wenn keiner läuft -> starten
-  if (!browser) return await launchBrowser();
-
-  // Ping: versuche kurz einen Context zu öffnen – wenn das fehlschlägt, relaunch
-  try {
-    const test = await browser.newContext();
-    await test.close();
-    return browser;
-  } catch {
-    return await launchBrowser();
-  }
-}
-
-/** Öffnet Context+Page und macht bei Fehlern (z. B. "browser closed") einen Relaunch und 1 Retry */
-async function openPageWithRetry() {
-  try {
-    const br = await getBrowser();
-    const ctx = await br.newContext({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-      locale: "de-DE",
-      timezoneId: "Europe/Berlin",
-      viewport: { width: 1366, height: 900 },
-      extraHTTPHeaders: { "Accept-Language": "de-DE,de;q=0.9,en;q=0.8" },
+  if (!browserPromise) {
+    browserPromise = chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-zygote",
+        "--single-process",
+      ],
     });
-    const page = await ctx.newPage();
-    return { ctx, page };
-  } catch (e) {
-    // 1x retry nach Relaunch
-    await launchBrowser();
-    const br = await getBrowser();
-    const ctx = await br.newContext({
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-      locale: "de-DE",
-      timezoneId: "Europe/Berlin",
-      viewport: { width: 1366, height: 900 },
-      extraHTTPHeaders: { "Accept-Language": "de-DE,de;q=0.9,en;q=0.8" },
-    });
-    const page = await ctx.newPage();
-    return { ctx, page };
   }
+  return browserPromise;
 }
+let running = false; // einfacher Mutex, 1 Task zur Zeit
 
 // ---------- Cache im Speicher ----------
 let LAST = { updatedAt: null, currency: "USDT", items: [] };
 
-// ---------- Routen ----------
+// ---------- Health ----------
 app.get("/", (_req, res) => res.type("text").send("OK"));
 app.get("/api/ping", (_req, res) => res.json({ ok: true, t: Date.now() }));
 
-// direkter Einzelscrape (Test/Debug)
-// GET /api/scrape-profit?url=...&all=1 oder &sel=.../&text=...
+// ---------- Einzelscrape (Debug) ----------
 app.get("/api/scrape-profit", async (req, res) => {
   const url = req.query.url;
   const sel = req.query.sel && String(req.query.sel).trim();
@@ -134,11 +86,19 @@ app.get("/api/scrape-profit", async (req, res) => {
 
   let ctx, page;
   try {
-    ({ ctx, page } = await openPageWithRetry());
+    const browser = await getBrowser();
+    ctx = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+      locale: "de-DE",
+      timezoneId: "Europe/Berlin",
+      viewport: { width: 1366, height: 900 },
+      extraHTTPHeaders: { "Accept-Language": "de-DE,de;q=0.9,en;q=0.8" },
+    });
+    page = await ctx.newPage();
     await page.goto(String(url), { waitUntil: "networkidle", timeout: 90000 });
-    await page.waitForTimeout(1200);
+    await page.waitForTimeout(1500);
 
-    // sichtbare Texte einsammeln
     let texts = [];
     if (sel) {
       try {
@@ -181,14 +141,12 @@ app.get("/api/scrape-profit", async (req, res) => {
   } catch (e) {
     return res.status(500).json({ error: String(e) });
   } finally {
-    try { await page?.close(); } catch {}
-    try { await ctx?.close(); } catch {}
+    try { if (page) await page.close(); } catch {}
+    try { if (ctx) await ctx.close(); } catch {}
   }
 });
 
-// --------- MANUELLES UPDATE: POST /api/refresh-now ---------
-let running = false; // einfacher Mutex, 1 Task zur Zeit
-
+// ---------- MANUELLES UPDATE: POST /api/refresh-now ----------
 app.post("/api/refresh-now", async (_req, res) => {
   if (running) return res.status(429).json({ ok: false, error: "already running" });
   running = true;
@@ -203,16 +161,25 @@ app.post("/api/refresh-now", async (_req, res) => {
     if (!list.length) throw new Error("copier list empty");
 
     const targetUrl = list[0].sourceUrl; // alle nutzen gleiche URL
+    const browser = await getBrowser();
+    ctx = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+      locale: "de-DE",
+      timezoneId: "Europe/Berlin",
+      viewport: { width: 1366, height: 900 },
+      extraHTTPHeaders: { "Accept-Language": "de-DE,de;q=0.9,en;q=0.8" },
+    });
+    page = await ctx.newPage();
 
-    ({ ctx, page } = await openPageWithRetry());
     await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 90000 });
-    await sleep(1200);
+    await sleep(1500);
 
     // minimal scrollen, weil Bitget gern lazy-loadet
-    await page.mouse.wheel(0, 400);
-    await sleep(600);
+    await page.mouse.wheel(0, 600);
+    await sleep(800);
 
-    // pro Follower den Gewinn extrahieren
+    // pro Follower die Gewinn-Zahl im jeweiligen Zeilen-/Karten-Container finden
     const whoList = list.map((c) => c.who);
     const found = await page.evaluate((names) => {
       function visible(el) {
@@ -222,57 +189,70 @@ app.post("/api/refresh-now", async (_req, res) => {
       function containsText(el, text) {
         return el && el.innerText && el.innerText.toLowerCase().includes(text.toLowerCase());
       }
-      function closestContainer(el, depth = 6) {
-        let cur = el;
-        for (let i = 0; i < depth && cur; i++) {
-          if (cur.matches?.("li, div[role='listitem'], .list-item, .card, .row, .cell, .flex, .grid"))
-            return cur;
+      // Ermittelt eine „Zeile/Karte“ um das Name-Element herum
+      function findRowContainer(nameEl) {
+        if (!nameEl) return null;
+        const selectors = [
+          "li", "div[role='row']", "div[role='listitem']", "tr",
+          "[class*='list-item']", "[class*='row']", "[class*='card']",
+          "[class*='item']", "[class*='list']", "section"
+        ];
+        let cur = nameEl;
+        for (let i = 0; i < 12 && cur; i++) {
+          for (const sel of selectors) {
+            const c = cur.closest?.(sel);
+            if (c && c.contains(nameEl)) return c;
+          }
           cur = cur.parentElement;
         }
-        return el?.parentElement || el;
+        return nameEl.parentElement || nameEl;
       }
-      const out = [];
-      const numRe = /[-+]?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?/g;
+      // Sucht im Container die grüne/rote Zahl mit Vorzeichen
+      function findSignedProfitIn(container) {
+        if (!container || !container.querySelectorAll) return null;
+        const profitNodes = container.querySelectorAll(
+          "span.text-content-trade-buy-text, span.text-content-trade-sell-text, " +
+          ".profit, .text-success, .text-danger, .green, .red, .up, .down, [style*='color']"
+        );
+        for (const el of profitNodes) {
+          if (!visible(el)) continue;
+          const t = el.textContent?.trim();
+          if (t && /[+-]\s*\d/.test(t)) return t;
+        }
+        return null;
+      }
 
+      const out = [];
       for (const name of names) {
-        const candidates = Array.from(document.querySelectorAll("body *"))
-          .filter((n) => visible(n) && containsText(n, name));
+        // nur Textblätter durchsuchen => weniger falsche Matches
+        const leafNodes = Array.from(document.querySelectorAll("body *")).filter(
+          (n) => visible(n) && n.children.length === 0 && n.textContent?.trim()
+        );
+        const candidates = leafNodes.filter((n) => containsText(n, name));
         if (!candidates.length) {
           out.push({ who: name, raw: null, profitText: null, error: "name not found" });
           continue;
         }
-        const card = closestContainer(candidates[0]);
-        let profitText = null;
-
-        // typische Klassen für die grüne/rote Zahl
-        const gainNodes = card.querySelectorAll
-          ? card.querySelectorAll(
-              "span.text-content-trade-buy-text, span.text-content-trade-sell-text, .profit, .text-success, .green, .up, [style*='color']"
-            )
-          : [];
-        for (const el of gainNodes) {
-          const t = el.textContent?.trim();
-          if (!t) continue;
-          if (!/[+-]\s*\d/.test(t)) continue;
-          profitText = t;
-          break;
+        let row = null;
+        for (const cand of candidates) {
+          const r = findRowContainer(cand);
+          if (r && r !== document.body) { row = r; break; }
         }
+        if (!row) {
+          out.push({ who: name, raw: null, profitText: null, error: "row not found" });
+          continue;
+        }
+        const profitText = findSignedProfitIn(row);
         if (!profitText) {
-          const text = card.innerText || "";
-          const m = text.match(numRe);
-          if (m && m.length) {
-            const idx = text.indexOf(m[0]);
-            const sign = /-/.test(text.slice(Math.max(0, idx - 3), idx + 1)) ? "-" : "+";
-            profitText = sign + m[0];
-          }
+          out.push({ who: name, raw: null, profitText: null, error: "profit not found" });
+        } else {
+          out.push({ who: name, raw: profitText, profitText });
         }
-        if (!profitText) out.push({ who: name, raw: null, profitText: null, error: "profit not found" });
-        else out.push({ who: name, raw: profitText, profitText });
       }
       return out;
     }, whoList);
 
-    // normalisieren & mit Stammdaten verheiraten
+    // normalisieren & zusammenführen
     const items = list.map((c) => {
       const hit = found.find((f) => f.who === c.who);
       let profit = null, raw = null, error = null;
@@ -293,18 +273,17 @@ app.post("/api/refresh-now", async (_req, res) => {
     });
 
     LAST = { updatedAt: new Date().toISOString(), currency, items };
-
     res.json({ ok: true, ...LAST });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e) });
   } finally {
-    try { await page?.close(); } catch {}
-    try { await ctx?.close(); } catch {}
+    try { if (page) await page.close(); } catch {}
+    try { if (ctx) await ctx.close(); } catch {}
     running = false;
   }
 });
 
-// --------- Cache lesen: GET /api/last-results ---------
+// ---------- Cache lesen ----------
 app.get("/api/last-results", (_req, res) => {
   res.json(LAST);
 });
@@ -312,11 +291,11 @@ app.get("/api/last-results", (_req, res) => {
 // ---------- Warmup ----------
 (async () => {
   try {
-    const br = await getBrowser();
-    const ctx = await br.newContext();
-    const p = await ctx.newPage();
+    const b = await getBrowser();
+    const c = await b.newContext();
+    const p = await c.newPage();
     await p.goto("https://example.com", { waitUntil: "domcontentloaded", timeout: 15000 });
-    await p.close(); await ctx.close();
+    await p.close(); await c.close();
     console.log("Warmup done");
   } catch (e) {
     console.log("Warmup skipped:", String(e));
@@ -325,7 +304,7 @@ app.get("/api/last-results", (_req, res) => {
 
 // ---------- Shutdown ----------
 process.on("SIGTERM", async () => {
-  try { if (browser) await browser.close(); }
+  try { if (browserPromise) (await browserPromise).close(); }
   finally { process.exit(0); }
 });
 
